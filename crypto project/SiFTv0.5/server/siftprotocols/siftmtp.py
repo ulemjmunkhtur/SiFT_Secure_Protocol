@@ -14,8 +14,8 @@ class SiFT_MTP:
 		# --------- CONSTANTS ------------
 		self.version_major = 0
 		self.version_minor = 5
-		self.msg_hdr_ver = b'\x00\x05'
-		self.size_msg_hdr = 6
+		self.msg_hdr_ver = b'\x00\x10'
+		self.size_msg_hdr = 16
 		self.size_msg_hdr_ver = 2
 		self.size_msg_hdr_typ = 2
 		self.size_msg_hdr_len = 2
@@ -35,23 +35,28 @@ class SiFT_MTP:
 						  self.type_dnload_req, self.type_dnload_res_0, self.type_dnload_res_1)
 		# --------- STATE ------------
 		self.peer_socket = peer_socket
-		self.peer_socket = peer_socket
 		self.temp_key = None
 		self.session_key = None
 		self.etk = None
-		self.sqn = None
+		self.sqn = 1
 		self.rnd = None
+		self.rsv= None
 		self.ciphertext = None 
 		self.tag = None
 
+		# keeping track of last received sqn number 
+
+		self.last_sqn= 0
 
 	# parses a message header and returns a dictionary containing the header fields
 	def parse_msg_header(self, msg_hdr):
-
 		parsed_msg_hdr, i = {}, 0
-		parsed_msg_hdr['ver'], i = msg_hdr[i:i+self.size_msg_hdr_ver], i+self.size_msg_hdr_ver 
-		parsed_msg_hdr['typ'], i = msg_hdr[i:i+self.size_msg_hdr_typ], i+self.size_msg_hdr_typ
-		parsed_msg_hdr['len'] = msg_hdr[i:i+self.size_msg_hdr_len]
+		parsed_msg_hdr['ver'], i = msg_hdr[i:i+2], i+2
+		parsed_msg_hdr['typ'], i = msg_hdr[i:i+2], i+2
+		parsed_msg_hdr['len'], i = msg_hdr[i:i+2], i+2
+		parsed_msg_hdr['sqn'], i = msg_hdr[i:i+2], i+2
+		parsed_msg_hdr['rnd'], i = msg_hdr[i:i+6], i+6
+		parsed_msg_hdr['rsv'], i = msg_hdr[i:i+2], i+2
 		return parsed_msg_hdr
 
 
@@ -93,6 +98,11 @@ class SiFT_MTP:
 
 		msg_len = int.from_bytes(parsed_msg_hdr['len'], byteorder='big')
 
+		# checking our sqn number to prevent replay attacks 
+
+		if int.from_bytes(parsed_msg_hdr['sqn'], byteorder='big') <= self.last_sqn:
+			raise SiFT_MTP_Error('Wrong sequence number :(')
+
 		try:
 			msg_body = self.receive_bytes(msg_len - self.size_msg_hdr)
 		except SiFT_MTP_Error as e:
@@ -109,9 +119,35 @@ class SiFT_MTP:
 
 		if len(msg_body) != msg_len - self.size_msg_hdr: 
 			raise SiFT_MTP_Error('Incomplete message body reveived')
+		
+		full_len = int.from_bytes(parsed_msg_hdr['len'], byteorder='big')
 
+		# Get encrypted payload and mac
+		try:
+			msg_body = self.receive_bytes(full_len - self.size_msg_hdr)
+			epd = msg_body[:-12]
+			mac = msg_body[-12:]
+		except SiFT_MTP_Error as e:
+			raise SiFT_MTP_Error('Unable to receive message body --> ' + e.err_msg)
+
+		if len(msg_body) != full_len - self.size_msg_hdr: 
+			raise SiFT_MTP_Error('Incomplete message body reveived')
+
+		nonce = parsed_msg_hdr['sqn'] + parsed_msg_hdr['rnd'] # nonce
+		AES_GCM = AES.new(self.ftrk, AES.MODE_GCM, nonce=nonce, mac_len=12) 
+		AES_GCM.update(msg_hdr) # update with encrypted payload
+
+		try:
+			msg_payload = AES_GCM.decrypt_and_verify(epd, mac)
+		except:
+			raise SiFT_MTP_Error('Unable to decrypt and verify message body')
+
+		self.last_received_sqn = int.from_bytes(parsed_msg_hdr['sqn'], byteorder='big')
+
+		return parsed_msg_hdr['typ'], msg_payload
+		
 		return parsed_msg_hdr['typ'], msg_body
-
+	
 
 	# sends all bytes provided via the peer socket
 	def send_bytes(self, bytes_to_send):
@@ -138,6 +174,22 @@ class SiFT_MTP:
 			print('------------------------------------------')
 		# DEBUG 
 
+		msg_size = self.size_msg_hdr + len(msg_payload) + 12
+		msg_hdr_len = msg_size.to_bytes(self.size_msg_hdr_len, byteorder='big')
+
+		sqn = self.sequence_number.to_bytes(2, byteorder="big") # Big endian byte order
+		rnd = Random.get_random_bytes(6) # freshly generated random bytes
+		rsv = b'\x00\x00' # 00 for now, reserved for future versions. 
+
+		msg_hdr = self.msg_hdr_ver + msg_type + msg_hdr_len + sqn + rnd + rsv 
+
+		# nonce
+		nonce = sqn + rnd
+
+		AES_GCM = AES.new(self.ftrk, AES.MODE_GCM, nonce=nonce, mac_len=12)
+		AES_GCM.update(msg_hdr)
+		epd, mac = AES_GCM.encrypt_and_digest(msg_payload) 
+ 
 		# try to send
 		try:
 			self.send_bytes(msg_hdr + msg_payload)
