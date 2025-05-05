@@ -1,9 +1,13 @@
 #python3
 
-import time
+
 from Crypto.Hash import SHA256
-from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Protocol.KDF import PBKDF2, HKDF
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP, AES
+from Crypto.Random import get_random_bytes
 from siftprotocols.siftmtp import SiFT_MTP, SiFT_MTP_Error
+
 
 
 class SiFT_LOGIN_Error(Exception):
@@ -22,6 +26,11 @@ class SiFT_LOGIN:
         self.mtp = mtp
         self.server_users = None 
 
+        # Transfer Key
+        self.rand_client = None
+        self.rand_server = None
+        self.final_key = None
+
 
     # sets user passwords dictionary (to be used by the server)
     def set_server_users(self, users):
@@ -29,35 +38,33 @@ class SiFT_LOGIN:
 
 
     # builds a login request from a dictionary
-    def build_login_req(self, login_req_struct):
-
-        login_req_str = login_req_struct['username']
-        login_req_str += self.delimiter + login_req_struct['password'] 
-        return login_req_str.encode(self.coding)
+    def build_login_req(self, timestamp, username, password, client_random):
+        req = f"{timestamp}{self.delimiter}{username}{self.delimiter}{password}{self.delimiter}{client_random.hex()}"
+        return req.encode(self.coding)
 
 
-    # parses a login request into a dictionary
     def parse_login_req(self, login_req):
-
-        login_req_fields = login_req.decode(self.coding).split(self.delimiter)
-        login_req_struct = {}
-        login_req_struct['username'] = login_req_fields[0]
-        login_req_struct['password'] = login_req_fields[1]
-        return login_req_struct
-
-
+        fields = login_req.decode(self.coding).split(self.delimiter)
+        return {
+            'timestamp': fields[0],
+            'username': fields[1],
+            'password': fields[2],
+            'client_random': bytes.fromhex(fields[3])
+        }
     # builds a login response from a dictionary
     def build_login_res(self, login_res_struct):
-
         login_res_str = login_res_struct['request_hash'].hex() 
+        login_res_str += self.delimiter + login_res_struct['server_random']
         return login_res_str.encode(self.coding)
 
 
     # parses a login response into a dictionary
     def parse_login_res(self, login_res):
         login_res_fields = login_res.decode(self.coding).split(self.delimiter)
-        login_res_struct = {}
-        login_res_struct['request_hash'] = bytes.fromhex(login_res_fields[0])
+        login_res_struct = {
+            'request_hash': bytes.fromhex(login_res_fields[0]),
+            'server_random': bytes.fromhex(login_res_fields[1])
+        }
         return login_res_struct
 
 
@@ -68,77 +75,94 @@ class SiFT_LOGIN:
         if pwdhash == usr_struct['pwdhash']: return True
         return False
 
-
-    # handles login process (to be used by the server)
-    def handle_login_server(self):
-
+def handle_login_server(self):
         if not self.server_users:
             raise SiFT_LOGIN_Error('User database is required for handling login at server')
 
-        # trying to receive a login request
         try:
             msg_type, msg_payload = self.mtp.receive_msg()
         except SiFT_MTP_Error as e:
             raise SiFT_LOGIN_Error('Unable to receive login request --> ' + e.err_msg)
 
-        # DEBUG 
-        if self.DEBUG:
-            print('Incoming payload (' + str(len(msg_payload)) + '):')
-            print(msg_payload[:max(512, len(msg_payload))].decode('utf-8'))
-            print('------------------------------------------')
-        # DEBUG 
-
         if msg_type != self.mtp.type_login_req:
             raise SiFT_LOGIN_Error('Login request expected, but received something else')
 
-        # processing login request
-        hash_fn = SHA256.new()
-        hash_fn.update(msg_payload)
-        request_hash = hash_fn.digest()
+        etk = msg_payload[-256:]
+        nonce = msg_payload[:8]
+        tag = msg_payload[8:20]
+        ciphertext = msg_payload[20:-256]
 
-        login_req_struct = self.parse_login_req(msg_payload)
+        with open("server_private_key.pem", "rb") as f:
+            rsa_privkey = RSA.import_key(f.read())
+        cipher_rsa = PKCS1_OAEP.new(rsa_privkey)
+        temp_key = cipher_rsa.decrypt(etk)
 
-        # checking username and password
-        if login_req_struct['username'] in self.server_users:
-            if not self.check_password(login_req_struct['password'], self.server_users[login_req_struct['username']]):
-                raise SiFT_LOGIN_Error('Password verification failed')
-        else:
-            raise SiFT_LOGIN_Error('Unkown user attempted to log in')
+        cipher = AES.new(temp_key, AES.MODE_GCM, nonce=nonce)
+        decrypted = cipher.decrypt_and_verify(ciphertext, tag)
+        login_req_struct = self.parse_login_req(decrypted)
 
-        # building login response
-        login_res_struct = {}
-        login_res_struct['request_hash'] = request_hash
-        msg_payload = self.build_login_res(login_res_struct)
+        username = login_req_struct['username']
+        password = login_req_struct['password']
+        client_random = login_req_struct['client_random']
 
-        # DEBUG 
-        if self.DEBUG:
-            print('Outgoing payload (' + str(len(msg_payload)) + '):')
-            print(msg_payload[:max(512, len(msg_payload))].decode('utf-8'))
-            print('------------------------------------------')
-        # DEBUG 
+        if username not in self.server_users or not self.check_password(password, self.server_users[username]):
+            raise SiFT_LOGIN_Error("Invalid credentials")
 
-        # sending login response
+        server_random = get_random_bytes(16)
+        login_res_struct = {
+            'request_hash': SHA256.new(decrypted).digest(),
+            'server_random': server_random
+        }
+
+        response = self.build_login_res(login_res_struct)
+        final_key = HKDF(temp_key, 32, b'', client_random + server_random, SHA256)
+        self.mtp.set_session_key(final_key)
+
         try:
-            self.mtp.send_msg(self.mtp.type_login_res, msg_payload)
+            self.mtp.send_msg(self.mtp.type_login_res, response)
         except SiFT_MTP_Error as e:
-            raise SiFT_LOGIN_Error('Unable to send login response --> ' + e.err_msg)
+            raise SiFT_LOGIN_Error("Unable to send login response --> " + e.err_msg)
 
-        # DEBUG 
         if self.DEBUG:
-            print('User ' + login_req_struct['username'] + ' logged in')
-        # DEBUG 
+            print("User", username, "logged in successfully.")
+        return username
 
-        return login_req_struct['username']
 
 
     # handles login process (to be used by the client)
-    def handle_login_client(self, username, password):
+def handle_login_client(self, username, password):
+        
+        # generates the timestamp, client_random, and temporary key
+        timestamp = str(time.time_ns())
+        client_random = get_random_bytes(16)
+        # this is the session key
+        temp_key = get_random_bytes(32)
+        
 
-        # building a login request
-        login_req_struct = {}
-        login_req_struct['username'] = username
-        login_req_struct['password'] = password
-        msg_payload = self.build_login_req(login_req_struct)
+        # creates the payload  
+        # function returns in bytes 
+        login_payload_bytes = self.build_login_req(timestamp, username, password, client_random)
+
+
+        # LOAD SERVER'S RSA PUBLIC KEY
+        with open("server_public_key.pem", "rb") as f:
+            rsa_pubkey = RSA.import_key(f.read())
+        cipher_rsa = PKCS1_OAEP.new(rsa_pubkey)
+        # THEN ENCRYPTS SESSION KEY
+        etk = cipher_rsa.encrypt(temp_key)
+ 
+        # GENERATES THE NONCE
+        sqn = (1).to_bytes(2, 'big')
+        rnd = get_random_bytes(6)
+        nonce = sqn + rnd
+
+        # ENCRYPTS PAYLOAD IN AES-GCM MODE
+        cipher = AES.new(temp_key, AES.MODE_GCM, nonce=nonce)
+        ciphertext, tag = cipher.encrypt_and_digest(login_payload_bytes)
+
+
+        # sets it as the temporary key
+        self.mtp.set_temp_key(temp_key, etk, sqn, rnd, ciphertext, tag)
 
         # DEBUG 
         if self.DEBUG:
@@ -173,11 +197,12 @@ class SiFT_LOGIN:
 
         if msg_type != self.mtp.type_login_res:
             raise SiFT_LOGIN_Error('Login response expected, but received something else')
-
-        # processing login response
+        
         login_res_struct = self.parse_login_res(msg_payload)
 
         # checking request_hash receiveid in the login response
         if login_res_struct['request_hash'] != request_hash:
             raise SiFT_LOGIN_Error('Verification of login response failed')
-
+        
+        final_key = HKDF(temp_key, 32, b'', client_random + login_res_struct['server_random'], SHA256)
+        self.mtp.set_session_key(final_key)
