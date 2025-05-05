@@ -1,6 +1,8 @@
 #python3
 
 import socket
+from Crypto.Cipher import PKCS1_OAEP, AES
+from Crypto.Random import get_random_bytes
 
 class SiFT_MTP_Error(Exception):
 
@@ -76,18 +78,16 @@ class SiFT_MTP:
 			bytes_count += len(chunk)
 		return bytes_received
 
-
 	# receives and parses message, returns msg_type and msg_payload
 	def receive_msg(self):
-
 		try:
 			msg_hdr = self.receive_bytes(self.size_msg_hdr)
 		except SiFT_MTP_Error as e:
 			raise SiFT_MTP_Error('Unable to receive message header --> ' + e.err_msg)
 
-		if len(msg_hdr) != self.size_msg_hdr: 
+		if len(msg_hdr) != self.size_msg_hdr:
 			raise SiFT_MTP_Error('Incomplete message header received')
-		
+
 		parsed_msg_hdr = self.parse_msg_header(msg_hdr)
 
 		if parsed_msg_hdr['ver'] != self.msg_hdr_ver:
@@ -98,56 +98,46 @@ class SiFT_MTP:
 
 		msg_len = int.from_bytes(parsed_msg_hdr['len'], byteorder='big')
 
-		# checking our sqn number to prevent replay attacks 
-
+		# Check for replay attack
 		if int.from_bytes(parsed_msg_hdr['sqn'], byteorder='big') <= self.last_sqn:
-			raise SiFT_MTP_Error('Wrong sequence number :(')
+			raise SiFT_MTP_Error('Wrong sequence number (possible replay attack)')
 
 		try:
 			msg_body = self.receive_bytes(msg_len - self.size_msg_hdr)
 		except SiFT_MTP_Error as e:
 			raise SiFT_MTP_Error('Unable to receive message body --> ' + e.err_msg)
 
-		# DEBUG 
-		if self.DEBUG:
-			print('MTP message received (' + str(msg_len) + '):')
-			print('HDR (' + str(len(msg_hdr)) + '): ' + msg_hdr.hex())
-			print('BDY (' + str(len(msg_body)) + '): ')
-			print(msg_body.hex())
-			print('------------------------------------------')
-		# DEBUG 
+		if len(msg_body) != msg_len - self.size_msg_hdr:
+			raise SiFT_MTP_Error('Incomplete message body received')
 
-		if len(msg_body) != msg_len - self.size_msg_hdr: 
-			raise SiFT_MTP_Error('Incomplete message body reveived')
-		
-		full_len = int.from_bytes(parsed_msg_hdr['len'], byteorder='big')
+		# Split encrypted payload and MAC
+		epd = msg_body[:-12]
+		mac = msg_body[-12:]
 
-		# Get encrypted payload and mac
-		try:
-			msg_body = self.receive_bytes(full_len - self.size_msg_hdr)
-			epd = msg_body[:-12]
-			mac = msg_body[-12:]
-		except SiFT_MTP_Error as e:
-			raise SiFT_MTP_Error('Unable to receive message body --> ' + e.err_msg)
+		# Construct nonce and decrypt
+		nonce = parsed_msg_hdr['sqn'] + parsed_msg_hdr['rnd']
+		if parsed_msg_hdr['typ'] == self.type_login_req:
+			key = self.temp_key
+		else:
+			key = self.session_key
 
-		if len(msg_body) != full_len - self.size_msg_hdr: 
-			raise SiFT_MTP_Error('Incomplete message body reveived')
+		if key is None:
+			raise SiFT_MTP_Error("Decryption key is not set (session_key or temp_key is None)")
 
-		nonce = parsed_msg_hdr['sqn'] + parsed_msg_hdr['rnd'] # nonce
-		AES_GCM = AES.new(self.ftrk, AES.MODE_GCM, nonce=nonce, mac_len=12) 
-		AES_GCM.update(msg_hdr) # update with encrypted payload
+		AES_GCM = AES.new(key, AES.MODE_GCM, nonce=nonce, mac_len=12)
+		AES_GCM.update(msg_hdr)
 
 		try:
 			msg_payload = AES_GCM.decrypt_and_verify(epd, mac)
 		except:
 			raise SiFT_MTP_Error('Unable to decrypt and verify message body')
 
-		self.last_received_sqn = int.from_bytes(parsed_msg_hdr['sqn'], byteorder='big')
+		# Store the new sequence number
+		self.last_sqn = int.from_bytes(parsed_msg_hdr['sqn'], byteorder='big')
 
 		return parsed_msg_hdr['typ'], msg_payload
-		
-		return parsed_msg_hdr['typ'], msg_body
-	
+
+			
 
 	# sends all bytes provided via the peer socket
 	def send_bytes(self, bytes_to_send):
@@ -156,59 +146,70 @@ class SiFT_MTP:
 		except:
 			raise SiFT_MTP_Error('Unable to send via peer socket')
 
-
 	# builds and sends message of a given type using the provided payload
 	def send_msg(self, msg_type, msg_payload):
-		
-		# build message
-		msg_size = self.size_msg_hdr + len(msg_payload)
-		msg_hdr_len = msg_size.to_bytes(self.size_msg_hdr_len, byteorder='big')
-		msg_hdr = self.msg_hdr_ver + msg_type + msg_hdr_len
-
-		# DEBUG 
-		if self.DEBUG:
-			print('MTP message to send (' + str(msg_size) + '):')
-			print('HDR (' + str(len(msg_hdr)) + '): ' + msg_hdr.hex())
-			print('BDY (' + str(len(msg_payload)) + '): ')
-			print(msg_payload.hex())
-			print('------------------------------------------')
-		# DEBUG 
-
+		# Calculate full message size (header + payload + MAC)
 		msg_size = self.size_msg_hdr + len(msg_payload) + 12
 		msg_hdr_len = msg_size.to_bytes(self.size_msg_hdr_len, byteorder='big')
 
-		sqn = self.sequence_number.to_bytes(2, byteorder="big") # Big endian byte order
-		rnd = Random.get_random_bytes(6) # freshly generated random bytes
-		rsv = b'\x00\x00' # 00 for now, reserved for future versions. 
+		# Build header components
+		sqn = self.sqn.to_bytes(2, byteorder='big')           # Current sequence number as bytes
+		rnd = get_random_bytes(6)                             # 6-byte random value
+		rsv = b'\x00\x00'                                     # Reserved field
 
-		msg_hdr = self.msg_hdr_ver + msg_type + msg_hdr_len + sqn + rnd + rsv 
+		# Final message header (16 bytes)
+		msg_hdr = self.msg_hdr_ver + msg_type + msg_hdr_len + sqn + rnd + rsv
 
-		# nonce
+		# Derive nonce = sqn || rnd
 		nonce = sqn + rnd
+			
+		if msg_type == self.type_login_req:
+			key = self.temp_key
+		else:
+			key = self.session_key
 
-		AES_GCM = AES.new(self.ftrk, AES.MODE_GCM, nonce=nonce, mac_len=12)
+		if key is None:
+			raise SiFT_MTP_Error("Encryption key is not set (session_key or temp_key is None)")
+		
+		# AES-GCM encryption
+		AES_GCM = AES.new(key, AES.MODE_GCM, nonce=nonce, mac_len=12)
 		AES_GCM.update(msg_hdr)
-		epd, mac = AES_GCM.encrypt_and_digest(msg_payload) 
- 
-		# try to send
+		epd, mac = AES_GCM.encrypt_and_digest(msg_payload)
+
+		# DEBUG
+		if self.DEBUG:
+			print('MTP message to send (' + str(msg_size) + '):')
+			print('HDR (' + str(len(msg_hdr)) + '): ' + msg_hdr.hex())
+			print('BDY (' + str(len(epd + mac)) + '): ')
+			print((epd + mac).hex())
+			print('------------------------------------------')
+
+		# Send complete message
 		try:
-			self.send_bytes(msg_hdr + msg_payload)
+			self.send_bytes(msg_hdr + epd + mac)
 		except SiFT_MTP_Error as e:
 			raise SiFT_MTP_Error('Unable to send message to peer --> ' + e.err_msg)
+
+		# Increment the sequence number
+		self.sqn += 1
+
 
 	def set_temp_key(self, temp_key, etk, sqn, rnd, ciphertext, tag):
 		self.temp_key = temp_key
 		self.etk = etk
-		self.sqn = sqn
+		self.sqn = int.from_bytes(sqn, byteorder='big')
 		self.rnd = rnd
 		self.ciphertext = ciphertext
 		self.tag = tag
 
 	def get_temp_msg_payload(self):
-		return self.sqn + self.rnd + self.tag + self.ciphertext + self.etk
+		return b''.join([
+			self.sqn.to_bytes(2, byteorder='big'),
+			self.rnd,
+			self.tag,
+			self.ciphertext,
+			self.etk
+		])
 
 	def set_session_key(self, session_key):
 		self.session_key = session_key
-
-
-
