@@ -81,43 +81,45 @@ class SiFT_LOGIN:
         client_random = get_random_bytes(16)
         temp_key = get_random_bytes(32)
 
-        # Create the login request message (plaintext)
+        # Create the login request message (plaintext payload)
         msg_payload = self.build_login_req(timestamp, username, password, client_random)
 
-        # Encrypt the temp_key using server's public RSA key
+        # Load server's RSA public key and encrypt the temporary AES key (tk)
         with open("server_public_key.pem", "rb") as f:
             rsa_pubkey = RSA.import_key(f.read())
         cipher_rsa = PKCS1_OAEP.new(rsa_pubkey)
-        etk = cipher_rsa.encrypt(temp_key)
-        etk_len = len(etk).to_bytes(2, 'big')  # add 2-byte length prefix
+        etk = cipher_rsa.encrypt(temp_key)  # This should be exactly 256 bytes
 
-        # Encrypt the message payload using AES-GCM
+        # Generate nonce from sqn and rnd
         sqn = (1).to_bytes(2, 'big')
         rnd = get_random_bytes(6)
-        nonce = sqn + rnd
+        nonce = sqn + rnd  # 8-byte nonce: 2-byte sequence + 6-byte random
+
+        # Encrypt payload with AES-GCM using temp_key
         cipher = AES.new(temp_key, AES.MODE_GCM, nonce=nonce)
         ciphertext, tag = cipher.encrypt_and_digest(msg_payload)
 
-        # Set temporary key info in MTP layer
-        self.mtp.set_temp_key(temp_key, etk, sqn, rnd, ciphertext, tag)
+        # Build header manually
+        msg_type = self.mtp.type_login_req
+        msg_hdr_ver = self.mtp.msg_hdr_ver
+        total_len = self.mtp.size_msg_hdr + len(ciphertext) + len(tag) + len(etk)
+        msg_hdr_len = total_len.to_bytes(self.mtp.size_msg_hdr_len, byteorder='big')
+        rsv = b'\x00\x00'
+        msg_hdr = msg_hdr_ver + msg_type + msg_hdr_len + sqn + rnd + rsv
 
-        # Debug
-        if self.DEBUG:
-            print('Outgoing payload (' + str(len(msg_payload)) + '):')
-            print(msg_payload.decode('utf-8'))
-            print('------------------------------------------')
+        # Build the full message: header + ciphertext + tag + etk
+        whole_msg = msg_hdr + ciphertext + tag + etk
 
-        # Construct final payload: sqn + rnd + tag + ciphertext + etk_len + etk
+        # Send the message over MTP
         try:
-            msg_payload = b''.join([sqn, rnd, tag, ciphertext, etk_len, etk])
-            self.mtp.send_msg(self.mtp.type_login_req, msg_payload)
+            self.mtp.send_bytes(whole_msg)  # Raw send, not send_msg(), since it's a login_req
         except SiFT_MTP_Error as e:
             raise SiFT_LOGIN_Error('Unable to send login request --> ' + e.err_msg)
 
-        # Compute hash of sent request for later verification
+        # Compute hash of original plaintext payload for validation
         request_hash = SHA256.new(msg_payload).digest()
 
-        # Receive and process response
+        # Receive the login response
         try:
             msg_type, msg_payload = self.mtp.receive_msg()
         except SiFT_MTP_Error as e:
@@ -131,10 +133,14 @@ class SiFT_LOGIN:
         if msg_type != self.mtp.type_login_res:
             raise SiFT_LOGIN_Error('Login response expected, but received something else')
 
+        # Parse and validate login response
         login_res_struct = self.parse_login_res(msg_payload)
-
         if login_res_struct['request_hash'] != request_hash:
             raise SiFT_LOGIN_Error('Verification of login response failed')
 
+        # Derive and store final transfer key
         final_key = HKDF(temp_key, 32, b'', client_random + login_res_struct['server_random'], SHA256)
         self.mtp.set_session_key(final_key)
+
+        if self.DEBUG:
+            print(f"User {username} logged in and session key established.")

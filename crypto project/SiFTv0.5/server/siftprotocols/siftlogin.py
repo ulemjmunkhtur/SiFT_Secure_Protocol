@@ -80,8 +80,8 @@ class SiFT_LOGIN:
         if not self.server_users:
             raise SiFT_LOGIN_Error('User database is required for handling login at server')
 
+        # Step 1: Receive message header and body manually
         try:
-            # Step 1: Receive message header and body manually
             msg_hdr = self.mtp.receive_bytes(self.mtp.size_msg_hdr)
             parsed_hdr = self.mtp.parse_msg_header(msg_hdr)
             msg_len = int.from_bytes(parsed_hdr['len'], byteorder='big')
@@ -92,25 +92,20 @@ class SiFT_LOGIN:
         if parsed_hdr['typ'] != self.mtp.type_login_req:
             raise SiFT_LOGIN_Error('Login request expected, but received something else')
 
-        # Step 2: Parse fields from msg_body
+        # Step 2: Extract nonce and split body
         try:
             sqn = parsed_hdr['sqn']
             rnd = parsed_hdr['rnd']
             nonce = sqn + rnd
 
-            offset = 0
-            tag = msg_body[offset:offset+12]
-            offset += 12
-
-            etk_len = int.from_bytes(msg_body[-2:], 'big')                # last 2 bytes
-            etk = msg_body[-(2 + etk_len):-2]                              # just before the 2-byte length
-            ciphertext = msg_body[12:-(2 + etk_len + 12)]                 # 12 for tag, 2 for etk_len, etk_len
-            mac = msg_body[-(12 + 2 + etk_len):- (2 + etk_len)]           # right before etk
-
+            # Layout: ciphertext | mac (12B) | etk (256B)
+            etk = msg_body[-256:]
+            mac = msg_body[-(256 + 12):-256]
+            ciphertext = msg_body[:-(256 + 12)]
         except Exception as e:
             raise SiFT_LOGIN_Error('Invalid login request format --> ' + str(e))
 
-        # Step 3: RSA decrypt the temp_key
+        # Step 3: Decrypt temp_key using RSA
         try:
             with open("server_private_key.pem", "rb") as f:
                 rsa_privkey = RSA.import_key(f.read())
@@ -119,7 +114,7 @@ class SiFT_LOGIN:
         except Exception as e:
             raise SiFT_LOGIN_Error('Unable to decrypt temp key with RSA --> ' + str(e))
 
-        # Step 4: AES-GCM decrypt login request
+        # Step 4: Decrypt and verify ciphertext using AES-GCM
         try:
             cipher = AES.new(temp_key, AES.MODE_GCM, nonce=nonce)
             cipher.update(msg_hdr)
@@ -127,19 +122,16 @@ class SiFT_LOGIN:
         except Exception as e:
             raise SiFT_LOGIN_Error('AES-GCM decryption or verification failed --> ' + str(e))
 
+        # Step 5: Parse and validate login credentials
         login_req_struct = self.parse_login_req(decrypted)
         username = login_req_struct['username']
         password = login_req_struct['password']
         client_random = login_req_struct['client_random']
 
-        # Step 5: Validate credentials
         if username not in self.server_users or not self.check_password(password, self.server_users[username]):
             raise SiFT_LOGIN_Error("Invalid credentials")
 
-        # Step 6: Save temp_key for login response encryption
-        self.mtp.set_temp_key(temp_key, etk, sqn, rnd, ciphertext, tag)
-
-        # Step 7: Build and send login response
+        # Step 6: Derive final transfer key
         server_random = get_random_bytes(16)
         login_res_struct = {
             'request_hash': SHA256.new(decrypted).digest(),
@@ -150,6 +142,7 @@ class SiFT_LOGIN:
         final_key = HKDF(temp_key, 32, b'', client_random + server_random, SHA256)
         self.mtp.set_session_key(final_key)
 
+        # Step 7: Send login response
         try:
             self.mtp.send_msg(self.mtp.type_login_res, response)
         except SiFT_MTP_Error as e:
