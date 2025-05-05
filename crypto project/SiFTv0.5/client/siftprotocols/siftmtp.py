@@ -35,6 +35,13 @@ class SiFT_MTP:
 						  self.type_dnload_req, self.type_dnload_res_0, self.type_dnload_res_1)
 		# --------- STATE ------------
 		self.peer_socket = peer_socket
+		self.temp_key = None
+		self.session_key = None
+		self.etk = None
+		self.sqn = None
+		self.rnd = None
+		self.ciphertext = None 
+		self.tag = None
 
 
 	# parses a message header and returns a dictionary containing the header fields
@@ -135,5 +142,20 @@ class SiFT_MTP:
 			self.send_bytes(msg_hdr + msg_payload)
 		except SiFT_MTP_Error as e:
 			raise SiFT_MTP_Error('Unable to send message to peer --> ' + e.err_msg)
+
+
+	def set_temp_key(self, temp_key, etk, sqn, rnd, ciphertext, tag):
+		self.temp_key = temp_key
+		self.etk = etk
+		self.sqn = sqn
+		self.rnd = rnd
+		self.ciphertext = ciphertext
+		self.tag = tag
+
+	def get_temp_msg_payload(self):
+		return self.sqn + self.rnd + self.tag + self.ciphertext + self.etk
+
+	def set_session_key(self, session_key):
+		self.session_key = session_key
 
 
