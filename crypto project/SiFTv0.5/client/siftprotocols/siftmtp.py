@@ -209,6 +209,3 @@ class SiFT_MTP:
 
 	def set_session_key(self, session_key):
 		self.session_key = session_key
-
-
-
